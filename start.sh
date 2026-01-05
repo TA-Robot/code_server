@@ -29,6 +29,13 @@ CODE_SERVER_EXTENSIONS="${CODE_SERVER_EXTENSIONS:-}"
 NPM_PREFIX="${NPM_PREFIX:-$HOME/.local}"
 REQUIRED_NODE_MAJOR="${REQUIRED_NODE_MAJOR:-22}"
 
+# Codex MCP（Playwright）
+INSTALL_PLAYWRIGHT_MCP="${INSTALL_PLAYWRIGHT_MCP:-1}"
+PLAYWRIGHT_MCP_NAME="${PLAYWRIGHT_MCP_NAME:-playwright}"
+PLAYWRIGHT_MCP_COMMAND="${PLAYWRIGHT_MCP_COMMAND:-npx}"
+# 空白区切りの引数（例: "-y @modelcontextprotocol/server-playwright"）
+PLAYWRIGHT_MCP_ARGS="${PLAYWRIGHT_MCP_ARGS:--y @modelcontextprotocol/server-playwright}"
+
 # systemd が無いコンテナ等で、最後に code-server を foreground 起動したい場合:
 AUTO_START_CODE_SERVER="${AUTO_START_CODE_SERVER:-0}"
 
@@ -255,6 +262,27 @@ install_codex_cli_npm() {
   have codex && log "codex version: $(codex --version 2>/dev/null || true)" || warn "codex が PATH で見つかりません"
 }
 
+ensure_codex_playwright_mcp() {
+  [[ "$INSTALL_PLAYWRIGHT_MCP" == "1" ]] || { log "Playwright MCP の追加はスキップします"; return 0; }
+
+  have codex || { warn "codex が見つからないため、Playwright MCP 追加をスキップします"; return 0; }
+  have npx || { warn "npx が見つからないため、Playwright MCP 追加をスキップします"; return 0; }
+
+  if codex mcp get "$PLAYWRIGHT_MCP_NAME" >/dev/null 2>&1; then
+    log "Codex MCP は既に登録済みです: ${PLAYWRIGHT_MCP_NAME}"
+    return 0
+  fi
+
+  log "Codex MCP を追加します: ${PLAYWRIGHT_MCP_NAME}"
+  # PLAYWRIGHT_MCP_ARGS は空白区切り前提
+  read -r -a args <<< "$PLAYWRIGHT_MCP_ARGS"
+  if codex mcp add "$PLAYWRIGHT_MCP_NAME" -- "$PLAYWRIGHT_MCP_COMMAND" "${args[@]}"; then
+    log "Codex MCP を追加しました: ${PLAYWRIGHT_MCP_NAME}"
+  else
+    warn "Codex MCP の追加に失敗しました: ${PLAYWRIGHT_MCP_NAME}"
+  fi
+}
+
 # =========================================================
 # Extensions
 # =========================================================
@@ -382,6 +410,7 @@ main() {
   setup_systemd_service
 
   install_codex_cli_npm
+  ensure_codex_playwright_mcp
 
   print_next_steps
 
