@@ -7,33 +7,29 @@ set -euo pipefail
 CODE_SERVER_PORT="${CODE_SERVER_PORT:-8080}"
 CODE_SERVER_BIND_ADDR="${CODE_SERVER_BIND_ADDR:-127.0.0.1}"
 
-# SSHトンネル前提なら none が楽。パスワード運用するなら password にして CODE_SERVER_PASSWORD を設定
+# SSHトンネル前提なら none が楽。パスワード運用なら password にして CODE_SERVER_PASSWORD を設定
 CODE_SERVER_AUTH="${CODE_SERVER_AUTH:-none}"   # none|password
 CODE_SERVER_PASSWORD="${CODE_SERVER_PASSWORD:-}"
 
-# 拡張インストールを無効化したい場合: INSTALL_CODE_SERVER_EXTENSIONS=0
+# 拡張インストール
 INSTALL_CODE_SERVER_EXTENSIONS="${INSTALL_CODE_SERVER_EXTENSIONS:-1}"
 INSTALL_AI_EXTENSIONS="${INSTALL_AI_EXTENSIONS:-1}"
 INSTALL_PYTHON_EXTENSIONS="${INSTALL_PYTHON_EXTENSIONS:-1}"
 INSTALL_DEVOPS_EXTENSIONS="${INSTALL_DEVOPS_EXTENSIONS:-1}"
+INSTALL_MARKDOWN_EXTENSIONS="${INSTALL_MARKDOWN_EXTENSIONS:-1}"
+INSTALL_LINT_FORMAT_EXTENSIONS="${INSTALL_LINT_FORMAT_EXTENSIONS:-1}"
+INSTALL_GIT_EXTENSIONS="${INSTALL_GIT_EXTENSIONS:-1}"
 
 # 拡張リストを外部ファイルで管理したい場合（1行1拡張、#コメントOK）
-# 例: CODE_SERVER_EXTENSIONS_FILE=/root/extensions.txt
 CODE_SERVER_EXTENSIONS_FILE="${CODE_SERVER_EXTENSIONS_FILE:-}"
-
 # もしくは env で上書き（空白/改行区切り）
-# 例: CODE_SERVER_EXTENSIONS="eamodio.gitlens esbenp.prettier-vscode"
 CODE_SERVER_EXTENSIONS="${CODE_SERVER_EXTENSIONS:-}"
 
 # Codex CLI を npm で入れる
-# 非root時のみ npm prefix をユーザー領域へ（sudo npm を避ける）
 NPM_PREFIX="${NPM_PREFIX:-$HOME/.local}"
-
-# Node の最低メジャー（Codex CLI が要求）
 REQUIRED_NODE_MAJOR="${REQUIRED_NODE_MAJOR:-22}"
 
 # systemd が無いコンテナ等で、最後に code-server を foreground 起動したい場合:
-# AUTO_START_CODE_SERVER=1
 AUTO_START_CODE_SERVER="${AUTO_START_CODE_SERVER:-0}"
 
 # =========================================================
@@ -56,28 +52,19 @@ init_privilege() {
   fi
 }
 
+# root なら bash -、非root なら sudo -E bash -
+pipe_to_bash() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    bash -
+  else
+    sudo -E bash -
+  fi
+}
+
 ensure_local_bin_on_path() {
   mkdir -p "$HOME/.local/bin"
   if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     export PATH="$HOME/.local/bin:$PATH"
-  fi
-
-  # 永続化（bash/zsh/profile）
-  local profile_file=""
-  if [[ -n "${BASH_VERSION:-}" ]]; then
-    profile_file="$HOME/.bashrc"
-  elif [[ -n "${ZSH_VERSION:-}" ]]; then
-    profile_file="$HOME/.zshrc"
-  else
-    profile_file="$HOME/.profile"
-  fi
-
-  if [[ -f "$profile_file" ]] && ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$profile_file"; then
-    {
-      echo ''
-      echo '# added by start.sh'
-      echo 'export PATH="$HOME/.local/bin:$PATH"'
-    } >> "$profile_file"
   fi
 }
 
@@ -110,9 +97,7 @@ install_code_server() {
   curl -fsSL https://code-server.dev/install.sh | sh
   ensure_local_bin_on_path
 
-  if ! have code-server; then
-    die "code-server が PATH で見つかりません。再ログインするか PATH を確認してください。"
-  fi
+  have code-server || die "code-server が PATH で見つかりません"
   log "code-server: $(code-server --version | head -n 1 || true)"
 }
 
@@ -122,7 +107,7 @@ write_code_server_config() {
   local cfg_file="$cfg_dir/config.yaml"
   mkdir -p "$cfg_dir"
 
-  # 重要: auth:none のとき password 行を出すと「--password requires a value」系の事故が起きるので出さない
+  # auth:none のとき password 行を出さない（空だとエラーになる）
   {
     echo "bind-addr: ${CODE_SERVER_BIND_ADDR}:${CODE_SERVER_PORT}"
     echo "auth: ${CODE_SERVER_AUTH}"
@@ -152,14 +137,12 @@ setup_systemd_service() {
     return 0
   fi
 
-  # code-server@.service があるならそれを使う
   if ${SUDO} systemctl list-unit-files | grep -qE '^code-server@\.service'; then
     log "systemd unit (code-server@.service) を利用して起動設定します"
     ${SUDO} systemctl enable --now "code-server@${USER}"
     return 0
   fi
 
-  # 無ければ自前ユニット
   log "systemd unit を作成します"
   local home_dir code_server_bin
   home_dir="$(eval echo "~${USER}")"
@@ -168,7 +151,7 @@ setup_systemd_service() {
   local svc_name="code-server-${USER}.service"
   local svc_path="/etc/systemd/system/${svc_name}"
 
-  ${SUDO} tee "$svc_path" >/dev/null <<EOF
+  ${SUDO} tee "$svc_path" >/dev/null <<EOT
 [Unit]
 Description=code-server for ${USER}
 After=network.target
@@ -186,7 +169,7 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOT
 
   ${SUDO} systemctl daemon-reload
   ${SUDO} systemctl enable --now "$svc_name"
@@ -199,20 +182,9 @@ node_major() {
   node -p "parseInt(process.versions.node.split('.')[0], 10)" 2>/dev/null || echo 0
 }
 
-pipe_to_bash() {
-  local url="$1"
-  if [[ -n "${SUDO:-}" ]]; then
-    curl -fsSL "$url" | ${SUDO} -E bash -
-  else
-    curl -fsSL "$url" | bash -
-  fi
-}
-
 ensure_node_and_npm() {
   local major=0
-  if have node; then
-    major="$(node_major)"
-  fi
+  if have node; then major="$(node_major)"; fi
 
   if have node && have npm && [[ "$major" -ge "$REQUIRED_NODE_MAJOR" ]]; then
     log "node: $(node --version 2>/dev/null || true) / npm: $(npm --version 2>/dev/null || true) (OK)"
@@ -222,20 +194,28 @@ ensure_node_and_npm() {
   log "Node.js ${REQUIRED_NODE_MAJOR}+ が必要なので更新します（current: v${major}）"
 
   if have apt-get; then
+    # dpkg復旧 + 競合除去（libnode-dev 12.x が /usr/include/node/* を持つため衝突）
+    ${SUDO} dpkg --configure -a || true
+    ${SUDO} apt-get -f install -y || true
+    ${SUDO} apt-get remove -y libnode-dev nodejs-dev nodejs-doc || true
+    ${SUDO} apt-get autoremove -y || true
+
     ${SUDO} apt-get update -y
     ${SUDO} apt-get install -y curl ca-certificates
-    pipe_to_bash "https://deb.nodesource.com/setup_${REQUIRED_NODE_MAJOR}.x"
+
+    # NodeSource repo setup -> Node 22
+    curl -fsSL "https://deb.nodesource.com/setup_${REQUIRED_NODE_MAJOR}.x" | pipe_to_bash
     ${SUDO} apt-get install -y nodejs
+
   elif have dnf; then
     ${SUDO} dnf install -y curl ca-certificates
-    pipe_to_bash "https://rpm.nodesource.com/setup_${REQUIRED_NODE_MAJOR}.x"
+    curl -fsSL "https://rpm.nodesource.com/setup_${REQUIRED_NODE_MAJOR}.x" | pipe_to_bash
     ${SUDO} dnf install -y nodejs
   elif have yum; then
     ${SUDO} yum install -y curl ca-certificates
-    pipe_to_bash "https://rpm.nodesource.com/setup_${REQUIRED_NODE_MAJOR}.x"
+    curl -fsSL "https://rpm.nodesource.com/setup_${REQUIRED_NODE_MAJOR}.x" | pipe_to_bash
     ${SUDO} yum install -y nodejs
   elif have apk; then
-    # Alpine: repoによりバージョン差があるので current を優先
     ${SUDO} apk add --no-cache curl ca-certificates || true
     ${SUDO} apk add --no-cache nodejs-current npm 2>/dev/null || ${SUDO} apk add --no-cache nodejs npm
   elif have pacman; then
@@ -249,7 +229,7 @@ ensure_node_and_npm() {
 
   major="$(node_major)"
   if [[ "$major" -lt "$REQUIRED_NODE_MAJOR" ]]; then
-    die "Node.js ${REQUIRED_NODE_MAJOR}+ が必要です（今: $(node --version)）。ベースイメージ/リポジトリ都合の可能性。"
+    die "Node.js ${REQUIRED_NODE_MAJOR}+ が必要です（今: $(node --version)）。"
   fi
 
   log "node: $(node --version 2>/dev/null || true) / npm: $(npm --version 2>/dev/null || true) (OK)"
@@ -266,18 +246,13 @@ install_codex_cli_npm() {
   if [[ "${EUID}" -eq 0 ]]; then
     npm install -g @openai/codex@latest
   else
-    # 非root: sudo npm を避けてユーザーprefixへ
     mkdir -p "$NPM_PREFIX/bin"
     npm config set prefix "$NPM_PREFIX" >/dev/null
     export PATH="$NPM_PREFIX/bin:$PATH"
     npm install -g @openai/codex@latest
   fi
 
-  if have codex; then
-    log "codex version: $(codex --version 2>/dev/null || true)"
-  else
-    warn "codex が PATH で見つかりません（npm prefix/bin が PATH に入っているか確認）"
-  fi
+  have codex && log "codex version: $(codex --version 2>/dev/null || true)" || warn "codex が PATH で見つかりません"
 }
 
 # =========================================================
@@ -286,45 +261,32 @@ install_codex_cli_npm() {
 default_extensions() {
   local exts=()
 
-  # Core
-  exts+=(
-    "eamodio.gitlens"
-    "mhutchie.git-graph"
-    "EditorConfig.EditorConfig"
-    "esbenp.prettier-vscode"
-    "dbaeumer.vscode-eslint"
-    "redhat.vscode-yaml"
-    "streetsidesoftware.code-spell-checker"
-    "yzhang.markdown-all-in-one"
-    "DavidAnson.vscode-markdownlint"
-    "christian-kohler.path-intellisense"
-  )
+  if [[ "$INSTALL_GIT_EXTENSIONS" == "1" ]]; then
+    exts+=("eamodio.gitlens" "mhutchie.git-graph")
+  fi
 
-  # Python / DS
+  exts+=("EditorConfig.EditorConfig" "christian-kohler.path-intellisense")
+  exts+=("redhat.vscode-yaml")
+  exts+=("streetsidesoftware.code-spell-checker")
+
+  if [[ "$INSTALL_LINT_FORMAT_EXTENSIONS" == "1" ]]; then
+    exts+=("esbenp.prettier-vscode" "dbaeumer.vscode-eslint")
+  fi
+
+  if [[ "$INSTALL_MARKDOWN_EXTENSIONS" == "1" ]]; then
+    exts+=("yzhang.markdown-all-in-one" "DavidAnson.vscode-markdownlint")
+  fi
+
   if [[ "$INSTALL_PYTHON_EXTENSIONS" == "1" ]]; then
-    exts+=(
-      "ms-python.python"
-      "ms-toolsai.jupyter"
-      "ms-pyright.pyright"
-    )
+    exts+=("ms-python.python" "ms-toolsai.jupyter" "ms-pyright.pyright")
   fi
 
-  # DevOps
   if [[ "$INSTALL_DEVOPS_EXTENSIONS" == "1" ]]; then
-    exts+=(
-      "ms-azuretools.vscode-docker"
-      "hashicorp.terraform"
-      "ms-kubernetes-tools.vscode-kubernetes-tools"
-    )
+    exts+=("ms-azuretools.vscode-docker" "hashicorp.terraform" "ms-kubernetes-tools.vscode-kubernetes-tools")
   fi
 
-  # AI（Copilot Chat は code-server(Open VSX) では見つからないことが多いので入れない）
   if [[ "$INSTALL_AI_EXTENSIONS" == "1" ]]; then
-    exts+=(
-      "Continue.continue"
-      "saoudrizwan.claude-dev"
-      "Codeium.codeium"
-    )
+    exts+=("Continue.continue" "saoudrizwan.claude-dev" "Codeium.codeium")
   fi
 
   printf "%s\n" "${exts[@]}"
@@ -333,6 +295,7 @@ default_extensions() {
 load_extensions() {
   local exts=()
 
+  # 優先順位: env > file > default
   if [[ -n "$CODE_SERVER_EXTENSIONS" ]]; then
     while IFS= read -r tok; do
       [[ -n "$tok" ]] && exts+=("$tok")
@@ -376,7 +339,7 @@ install_code_server_extensions() {
 
   log "拡張インストール結果: OK=${#ok[@]} / NG=${#ng[@]}"
   if [[ "${#ng[@]}" -gt 0 ]]; then
-    warn "見つからない/互換性NG（Open VSX未掲載など）の可能性:"
+    warn "NG一覧:"
     printf "  - %s\n" "${ng[@]}" >&2
   fi
 }
@@ -412,17 +375,12 @@ main() {
   init_privilege
   install_base_packages
 
-  # code-server
   install_code_server
   write_code_server_config
 
-  # 拡張（configが読める状態で入れる）
   install_code_server_extensions
-
-  # systemd が使えるならサービス化（コンテナなら自動スキップ）
   setup_systemd_service
 
-  # Codex（Node 22+ に更新してから）
   install_codex_cli_npm
 
   print_next_steps
