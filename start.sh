@@ -6,12 +6,30 @@ set -euo pipefail
 # ==========
 CODE_SERVER_PORT="${CODE_SERVER_PORT:-8080}"
 CODE_SERVER_BIND_ADDR="${CODE_SERVER_BIND_ADDR:-127.0.0.1}"
-# SSHトンネル前提なら none が楽。パスワード運用なら password にして CODE_SERVER_PASSWORD を設定
 CODE_SERVER_AUTH="${CODE_SERVER_AUTH:-none}"   # none|password
-CODE_SERVER_PASSWORD="${CODE_SERVER_PASSWORD:-}"
+CODE_SERVER_PASSWORD="${CODE_SERVER_PASSWORD:-password}"
 
-# 非root時のみ npm の global prefix をユーザー領域へ
+# 拡張インストールを無効化したい場合: INSTALL_CODE_SERVER_EXTENSIONS=0
+INSTALL_CODE_SERVER_EXTENSIONS="${INSTALL_CODE_SERVER_EXTENSIONS:-1}"
+# セット毎にON/OFF
+INSTALL_AI_EXTENSIONS="${INSTALL_AI_EXTENSIONS:-1}"
+INSTALL_PYTHON_EXTENSIONS="${INSTALL_PYTHON_EXTENSIONS:-1}"
+INSTALL_DEVOPS_EXTENSIONS="${INSTALL_DEVOPS_EXTENSIONS:-1}"
+
+# 拡張リストを外部ファイルで管理したい場合（1行1拡張、#コメントOK）
+# 例: CODE_SERVER_EXTENSIONS_FILE=/root/extensions.txt
+CODE_SERVER_EXTENSIONS_FILE="${CODE_SERVER_EXTENSIONS_FILE:-}"
+
+# もしくは env で上書き（空白/改行区切り）
+# 例: CODE_SERVER_EXTENSIONS="eamodio.gitlens esbenp.prettier-vscode"
+CODE_SERVER_EXTENSIONS="${CODE_SERVER_EXTENSIONS:-}"
+
+# Codex CLI を npm で入れる（rootなら通常の -g、非rootならprefixをユーザー領域へ）
 NPM_PREFIX="${NPM_PREFIX:-$HOME/.local}"
+
+# systemd が無いコンテナ等で、最後に code-server を foreground 起動したい場合:
+# AUTO_START_CODE_SERVER=1
+AUTO_START_CODE_SERVER="${AUTO_START_CODE_SERVER:-0}"
 
 # ==========
 # ユーティリティ
@@ -21,7 +39,6 @@ warn() { echo -e "\033[1;33m[warn ]\033[0m $*" >&2; }
 die()  { echo -e "\033[1;31m[err  ]\033[0m $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# rootならsudo不要、非rootならsudo必須
 SUDO=""
 init_privilege() {
   if [[ "${EUID}" -eq 0 ]]; then
@@ -38,25 +55,6 @@ ensure_local_bin_on_path() {
   mkdir -p "$HOME/.local/bin"
   if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     export PATH="$HOME/.local/bin:$PATH"
-  fi
-
-  # 永続化（bash/zsh/profile）
-  local profile_file
-  if [[ -n "${BASH_VERSION:-}" ]]; then
-    profile_file="$HOME/.bashrc"
-  elif [[ -n "${ZSH_VERSION:-}" ]]; then
-    profile_file="$HOME/.zshrc"
-  else
-    profile_file="$HOME/.profile"
-  fi
-
-  # rootのときも /root に追記されるだけなので問題なし
-  if [[ -f "$profile_file" ]] && ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$profile_file"; then
-    {
-      echo ''
-      echo '# added by start.sh'
-      echo 'export PATH="$HOME/.local/bin:$PATH"'
-    } >> "$profile_file"
   fi
 }
 
@@ -78,13 +76,11 @@ install_base_packages() {
 
 install_code_server() {
   log "code-server を公式 install.sh でインストールします"
-  # rootならシステム領域に入ることが多い／非rootでもOK
   curl -fsSL https://code-server.dev/install.sh | sh
-
   ensure_local_bin_on_path
 
   if ! have code-server; then
-    die "code-server が PATH で見つかりません。再ログインするか PATH を確認してください。"
+    die "code-server が PATH で見つかりません。PATH を確認してください。"
   fi
   log "code-server: $(code-server --version | head -n 1 || true)"
 }
@@ -115,7 +111,6 @@ EOF
 }
 
 systemd_is_usable() {
-  # systemctlがあってもコンテナだと動かないケースが多いのでガード
   have systemctl || return 1
   systemctl is-system-running >/dev/null 2>&1 || return 1
   return 0
@@ -123,18 +118,16 @@ systemd_is_usable() {
 
 setup_systemd_service() {
   if ! systemd_is_usable; then
-    warn "systemd が動いていないためサービス化はスキップします（必要なら手動起動してください）"
+    warn "systemd が動いていないためサービス化はスキップします"
     return 0
   fi
 
-  # code-server@.service があるならそれを使う
   if ${SUDO} systemctl list-unit-files | grep -qE '^code-server@\.service'; then
     log "systemd unit (code-server@.service) を利用して起動設定します"
     ${SUDO} systemctl enable --now "code-server@${USER}"
     return 0
   fi
 
-  # 無ければ自前ユニットを作る
   log "systemd unit を作成します"
   local home_dir code_server_bin
   home_dir="$(eval echo "~${USER}")"
@@ -195,46 +188,135 @@ ensure_node_and_npm() {
 install_codex_cli_npm() {
   log "Codex CLI を npm でインストールします（@openai/codex）"
   ensure_node_and_npm
+  ensure_local_bin_on_path
 
   if [[ "${EUID}" -eq 0 ]]; then
-    # rootなら素直にグローバルへ（/usr/local など）
     npm install -g @openai/codex
   else
-    # 非rootなら sudo npm を避けてユーザー領域へ
     mkdir -p "$NPM_PREFIX/bin"
     npm config set prefix "$NPM_PREFIX" >/dev/null
-    ensure_local_bin_on_path
+    export PATH="$NPM_PREFIX/bin:$PATH"
     npm install -g @openai/codex
   fi
 
-  if have codex; then
-    log "codex version: $(codex --version 2>/dev/null || true)"
-  else
-    warn "codex が PATH で見つかりません。npmのprefix/binがPATHに入っているか確認してください。"
+  have codex && log "codex version: $(codex --version 2>/dev/null || true)" || warn "codex が PATH で見つかりません"
+}
+
+# ==========
+# Extensions
+# ==========
+default_extensions() {
+  local exts=()
+
+  # --- Core（ほぼ全員入れる枠）
+  exts+=(
+    "eamodio.gitlens"
+    "mhutchie.git-graph"
+    "EditorConfig.EditorConfig"
+    "esbenp.prettier-vscode"
+    "dbaeumer.vscode-eslint"
+    "redhat.vscode-yaml"
+    "streetsidesoftware.code-spell-checker"
+    "yzhang.markdown-all-in-one"
+    "DavidAnson.vscode-markdownlint"
+    "christian-kohler.path-intellisense"
+  )
+
+  # --- Python / DS
+  if [[ "$INSTALL_PYTHON_EXTENSIONS" == "1" ]]; then
+    exts+=(
+      "ms-python.python"
+      "ms-toolsai.jupyter"
+      "ms-pyright.pyright"
+    )
+  fi
+
+  # --- DevOps（必要なら）
+  if [[ "$INSTALL_DEVOPS_EXTENSIONS" == "1" ]]; then
+    exts+=(
+      "ms-azuretools.vscode-docker"
+      "hashicorp.terraform"
+      "ms-kubernetes-tools.vscode-kubernetes-tools"
+    )
+  fi
+
+  # --- AI（Cursorっぽさ寄せ）
+  if [[ "$INSTALL_AI_EXTENSIONS" == "1" ]]; then
+    exts+=(
+      "Continue.continue"
+      "saoudrizwan.claude-dev"
+      "Codeium.codeium"
+    )
+  fi
+
+  printf "%s\n" "${exts[@]}"
+}
+
+load_extensions() {
+  local exts=()
+
+  if [[ -n "$CODE_SERVER_EXTENSIONS" ]]; then
+    # 空白/改行区切りを配列化
+    while IFS= read -r tok; do
+      [[ -n "$tok" ]] && exts+=("$tok")
+    done < <(printf "%s" "$CODE_SERVER_EXTENSIONS" | tr ' ' '\n' | sed '/^\s*$/d')
+    printf "%s\n" "${exts[@]}"
+    return 0
+  fi
+
+  if [[ -n "$CODE_SERVER_EXTENSIONS_FILE" ]]; then
+    [[ -f "$CODE_SERVER_EXTENSIONS_FILE" ]] || die "CODE_SERVER_EXTENSIONS_FILE が見つかりません: $CODE_SERVER_EXTENSIONS_FILE"
+    while IFS= read -r line; do
+      # コメント除去 + trim
+      line="${line%%#*}"
+      line="$(echo "$line" | xargs || true)"
+      [[ -z "$line" ]] && continue
+      exts+=("$line")
+    done < "$CODE_SERVER_EXTENSIONS_FILE"
+    printf "%s\n" "${exts[@]}"
+    return 0
+  fi
+
+  default_extensions
+}
+
+install_code_server_extensions() {
+  [[ "$INSTALL_CODE_SERVER_EXTENSIONS" == "1" ]] || { log "拡張インストールはスキップします"; return 0; }
+
+  log "code-server 拡張を一括インストールします（Open VSX前提）"
+  local ok=() ng=()
+
+  while IFS= read -r ext; do
+    [[ -z "$ext" ]] && continue
+    log "  -> $ext"
+    if code-server --install-extension "$ext" >/tmp/code_server_ext_install.log 2>&1; then
+      ok+=("$ext")
+    else
+      ng+=("$ext")
+      warn "     失敗: $ext"
+      tail -n 8 /tmp/code_server_ext_install.log >&2 || true
+    fi
+  done < <(load_extensions)
+
+  log "拡張インストール結果: OK=${#ok[@]} / NG=${#ng[@]}"
+  if [[ "${#ng[@]}" -gt 0 ]]; then
+    warn "見つからない/互換性NGの拡張（Open VSX未掲載など）の可能性があります:"
+    printf "  - %s\n" "${ng[@]}" >&2
   fi
 }
 
 print_next_steps() {
   echo
   log "✅ セットアップ完了"
-  echo
-  echo "起動方法（systemd が無い/動かない場合）:"
-  echo "  code-server --config \"$HOME/.config/code-server/config.yaml\""
-  echo
-  echo "ローカルPCからSSHトンネル（例）:"
-  echo "  ssh -N -L ${CODE_SERVER_PORT}:127.0.0.1:${CODE_SERVER_PORT} ${USER}@<server>"
-  echo
-  echo "ブラウザ:"
-  echo "  http://127.0.0.1:${CODE_SERVER_PORT}"
-  echo
-  echo "Codex:"
-  echo "  codex"
-  echo
+  echo "code-server: http://127.0.0.1:${CODE_SERVER_PORT} （SSHトンネル経由でアクセス）"
   if [[ "$CODE_SERVER_AUTH" == "password" ]]; then
-    echo "code-server password: ${CODE_SERVER_PASSWORD}"
+    echo "password: ${CODE_SERVER_PASSWORD}"
   else
-    echo "code-server auth: none（SSHトンネル前提）"
+    echo "auth: none（SSHトンネル前提）"
   fi
+  echo
+  echo "手動起動（systemd無しの場合）:"
+  echo "  code-server --config \"$HOME/.config/code-server/config.yaml\""
 }
 
 main() {
@@ -242,9 +324,22 @@ main() {
   install_base_packages
   install_code_server
   write_code_server_config
+
+  # ここで拡張を入れておく（起動前）
+  install_code_server_extensions
+
+  # systemd がある環境ならサービス化
   setup_systemd_service
+
+  # Codex CLI
   install_codex_cli_npm
+
   print_next_steps
+
+  if [[ "$AUTO_START_CODE_SERVER" == "1" ]]; then
+    log "AUTO_START_CODE_SERVER=1 のため、foregroundで起動します"
+    exec code-server --config "$HOME/.config/code-server/config.yaml"
+  fi
 }
 
 main "$@"
