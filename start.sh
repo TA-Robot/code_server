@@ -310,7 +310,7 @@ default_extensions() {
   fi
 
   if [[ "$INSTALL_DEVOPS_EXTENSIONS" == "1" ]]; then
-    exts+=("ms-azuretools.vscode-docker" "hashicorp.terraform" "ms-kubernetes-tools.vscode-kubernetes-tools")
+    exts+=("ms-azuretools.vscode-docker" "ms-vscode-remote.remote-containers" "hashicorp.terraform" "ms-kubernetes-tools.vscode-kubernetes-tools")
   fi
 
   if [[ "$INSTALL_AI_EXTENSIONS" == "1" ]]; then
